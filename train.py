@@ -77,6 +77,10 @@ def save_to_github(epoch, ckpt_file):
         dest = os.path.join(GITHUB_FOLDER, "checkpoints", f"epoch_{epoch:04d}.pth")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy(ckpt_file, dest)
+        dst_out = os.path.join(GITHUB_FOLDER, "outputs")
+        os.makedirs(dst_out, exist_ok=True)
+        for f in os.listdir("./outputs"):
+            shutil.copy(os.path.join("./outputs", f), os.path.join(dst_out, f))
         subprocess.run(["git", "-C", GITHUB_FOLDER, "add", "."], check=True)
         subprocess.run(["git", "-C", GITHUB_FOLDER, "commit", "-m", f"GAN epoch {epoch}"], check=True)
         subprocess.run(["git", "-C", GITHUB_FOLDER, "push"], check=True)
