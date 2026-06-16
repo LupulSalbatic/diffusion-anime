@@ -11,14 +11,14 @@ from model import Generator, Discriminator
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 IMAGE_SIZE    = 512
-BATCH_SIZE    = 8          # mareste la 12-16 daca ai VRAM liber
+BATCH_SIZE    = 4          # mareste la 12-16 daca ai VRAM liber
 NUM_EPOCHS    = 300
-LR_G          = 1e-4
-LR_D          = 4e-4
+LR_G          = 2e-5
+LR_D          = 8e-5
 Z_DIM         = 128
 BASE_CH       = 64
-N_CRITIC      = 3          # discriminator steps per generator step
-LAMBDA_GP     = 10
+N_CRITIC      = 1          # discriminator steps per generator step
+LAMBDA_GP     = 5
 SAVE_EVERY    = 5
 SAMPLE_EVERY  = 2
 NUM_SAMPLES   = 16
