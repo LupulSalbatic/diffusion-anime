@@ -49,7 +49,7 @@ rm /tmp/kaggle/*.zip
 
 # Organizeaza pentru PyTorch ImageFolder
 mkdir -p ./dataset/anime
-mv /tmp/extracted/portraits/* ./dataset/anime/
+find /tmp/extracted/portraits/ -name "*.jpg" -exec mv {} ./dataset/anime/ \;
 rm -rf /tmp/extracted /tmp/kaggle
 
 TOTAL=$(ls ./dataset/anime | wc -l)
