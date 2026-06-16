@@ -11,17 +11,17 @@ from model import Generator, Discriminator
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 IMAGE_SIZE    = 512
-BATCH_SIZE    = 4          # mareste la 12-16 daca ai VRAM liber
+BATCH_SIZE    = 4
 NUM_EPOCHS    = 300
 LR_G          = 2e-5
 LR_D          = 8e-5
 Z_DIM         = 128
 BASE_CH       = 64
-N_CRITIC      = 1          # discriminator steps per generator step
+N_CRITIC      = 1
 LAMBDA_GP     = 5
 SAVE_EVERY    = 5
 SAMPLE_EVERY  = 2
-NUM_SAMPLES   = 16
+NUM_SAMPLES   = 4          # redus la 4 pentru a evita OOM la sampling
 
 DATASET_PATH  = "./dataset"
 OUTPUT_PATH   = "./outputs"
@@ -54,18 +54,25 @@ def gradient_penalty(disc, real, fake):
 # ─── DATASET ─────────────────────────────────────────────────────────────────
 def get_dataloader():
     transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE + 32, IMAGE_SIZE + 32)),
+        transforms.Resize((IMAGE_SIZE + 32, IMAGE_SIZE + 32),
+                          interpolation=transforms.InterpolationMode.LANCZOS),
         transforms.RandomCrop(IMAGE_SIZE),
         transforms.RandomHorizontalFlip(),
-        transforms.ColorJitter(brightness=0.15, contrast=0.15, saturation=0.15, hue=0.05),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15,
+                               saturation=0.15, hue=0.05),
         transforms.ToTensor(),
         transforms.Normalize([0.5]*3, [0.5]*3),
     ])
     dataset = datasets.ImageFolder(DATASET_PATH, transform=transform)
     print(f"[INFO] Dataset: {len(dataset)} imagini")
     return DataLoader(
-        dataset, batch_size=BATCH_SIZE, shuffle=True,
-        num_workers=4, pin_memory=True, drop_last=True,
+        dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=4,
+        pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,  # workers raman activi intre epoci
     )
 
 
@@ -74,17 +81,21 @@ def save_to_github(epoch, ckpt_file):
     try:
         if not os.path.exists(GITHUB_FOLDER):
             subprocess.run(["git", "clone", GITHUB_REPO, GITHUB_FOLDER], check=True)
+        # Checkpoint
         dest = os.path.join(GITHUB_FOLDER, "checkpoints", f"epoch_{epoch:04d}.pth")
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy(ckpt_file, dest)
+        # Sample-uri
         dst_out = os.path.join(GITHUB_FOLDER, "outputs")
         os.makedirs(dst_out, exist_ok=True)
-        for f in os.listdir("./outputs"):
-            shutil.copy(os.path.join("./outputs", f), os.path.join(dst_out, f))
+        for f in os.listdir(OUTPUT_PATH):
+            shutil.copy(os.path.join(OUTPUT_PATH, f), os.path.join(dst_out, f))
+        # Push
         subprocess.run(["git", "-C", GITHUB_FOLDER, "add", "."], check=True)
-        subprocess.run(["git", "-C", GITHUB_FOLDER, "commit", "-m", f"GAN epoch {epoch}"], check=True)
+        subprocess.run(["git", "-C", GITHUB_FOLDER, "commit",
+                        "-m", f"GAN epoch {epoch}"], check=True)
         subprocess.run(["git", "-C", GITHUB_FOLDER, "push"], check=True)
-        print(f"[GitHub] Checkpoint epoch {epoch} salvat!")
+        print(f"[GitHub] Salvat epoch {epoch}!")
     except Exception as e:
         print(f"[GitHub] EROARE: {e}")
 
@@ -103,18 +114,23 @@ def train():
 
     opt_G = torch.optim.Adam(G.parameters(), lr=LR_G, betas=(0.0, 0.9))
     opt_D = torch.optim.Adam(D.parameters(), lr=LR_D, betas=(0.0, 0.9))
-    sched_G = torch.optim.lr_scheduler.LinearLR(opt_G, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPOCHS)
-    sched_D = torch.optim.lr_scheduler.LinearLR(opt_D, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPOCHS)
+
+    # LR scade lin de la 100% la 10% pe parcursul antrenamentului
+    sched_G = torch.optim.lr_scheduler.LinearLR(
+        opt_G, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPOCHS)
+    sched_D = torch.optim.lr_scheduler.LinearLR(
+        opt_D, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPOCHS)
+
     scaler_G = GradScaler('cuda')
     scaler_D = GradScaler('cuda')
 
     loader = get_dataloader()
 
-    # Resume automat daca exista checkpoint
+    # Resume automat
     start_epoch = 0
     latest_ckpt = os.path.join(CKPT_PATH, "latest.pth")
     if os.path.exists(latest_ckpt):
-        ckpt = torch.load(latest_ckpt, map_location=DEVICE)
+        ckpt = torch.load(latest_ckpt, map_location=DEVICE, weights_only=True)
         G.load_state_dict(ckpt["G"])
         D.load_state_dict(ckpt["D"])
         opt_G.load_state_dict(ckpt["opt_G"])
@@ -122,7 +138,9 @@ def train():
         start_epoch = ckpt["epoch"] + 1
         print(f"[INFO] Resumed de la epoca {start_epoch}")
 
+    # Noise fix pentru sample-uri consistente intre epoci
     fixed_z = torch.randn(NUM_SAMPLES, Z_DIM, device=DEVICE)
+
     print(f"[INFO] Incep antrenamentul de la epoca {start_epoch}...")
 
     for epoch in range(start_epoch, NUM_EPOCHS):
@@ -164,22 +182,27 @@ def train():
 
         sched_G.step()
         sched_D.step()
-        print(f"\n[Epoca {epoch}] D: {total_d/len(loader):.4f} | G: {total_g/len(loader):.4f}\n")
+        print(f"\n[Epoca {epoch}] D: {total_d/len(loader):.4f} | "
+              f"G: {total_g/len(loader):.4f} | "
+              f"LR_G: {sched_G.get_last_lr()[0]:.2e}\n")
 
-        # Sample-uri vizuale
+        # Sample-uri vizuale (cu torch.no_grad + batch mic)
         if epoch % SAMPLE_EVERY == 0:
             G.eval()
             with torch.no_grad():
-                samples = (G(fixed_z[:4]).clamp(-1, 1) + 1) / 2
-            save_image(samples, os.path.join(OUTPUT_PATH, f"epoch_{epoch:04d}.png"), nrow=4)
+                samples = (G(fixed_z).clamp(-1, 1) + 1) / 2
+            save_image(samples, os.path.join(OUTPUT_PATH, f"epoch_{epoch:04d}.png"), nrow=2)
             print(f"[INFO] Sample: epoch_{epoch:04d}.png")
             G.train()
 
         # Checkpoint + GitHub
         if epoch % SAVE_EVERY == 0:
             ckpt_data = {
-                "epoch": epoch, "G": G.state_dict(), "D": D.state_dict(),
-                "opt_G": opt_G.state_dict(), "opt_D": opt_D.state_dict(),
+                "epoch": epoch,
+                "G": G.state_dict(),
+                "D": D.state_dict(),
+                "opt_G": opt_G.state_dict(),
+                "opt_D": opt_D.state_dict(),
             }
             ckpt_file = os.path.join(CKPT_PATH, f"epoch_{epoch:04d}.pth")
             torch.save(ckpt_data, ckpt_file)
