@@ -55,6 +55,17 @@ rm -rf /tmp/extracted /tmp/kaggle
 TOTAL=$(ls ./dataset/anime | wc -l)
 echo "Total imagini extrase: $TOTAL"
 
+# Pastreaza doar 50k imagini random
+echo "Pastrez 50000 imagini..."
+python3 -c "
+import os, random
+folder = './dataset/anime'
+files = os.listdir(folder)
+keep = set(random.sample(files, 50000))
+[os.remove(os.path.join(folder, f)) for f in files if f not in keep]
+print(f'Ramase: {len(os.listdir(folder))}')
+"
+
 # 5. Git config
 echo "[5/5] Configurez Git..."
 git config --global user.email "vast.training@gmail.com"
@@ -70,3 +81,4 @@ echo ""
 echo "  Apoi porneste antrenamentul:"
 echo "  PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True python3 train.py"
 echo "=============================="
+
