@@ -19,8 +19,8 @@ Z_DIM         = 128
 BASE_CH       = 64
 N_CRITIC      = 1
 LAMBDA_GP     = 5
-SAVE_EVERY    = 5
-SAMPLE_EVERY  = 2
+SAVE_EVERY    = 1
+SAMPLE_EVERY  = 1
 NUM_SAMPLES   = 4          # redus la 4 pentru a evita OOM la sampling
 
 DATASET_PATH  = "./dataset"
