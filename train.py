@@ -170,7 +170,7 @@ def train():
         if epoch % SAMPLE_EVERY == 0:
             G.eval()
             with torch.no_grad():
-                samples = (G(fixed_z).clamp(-1, 1) + 1) / 2
+                samples = (G(fixed_z[:4]).clamp(-1, 1) + 1) / 2
             save_image(samples, os.path.join(OUTPUT_PATH, f"epoch_{epoch:04d}.png"), nrow=4)
             print(f"[INFO] Sample: epoch_{epoch:04d}.png")
             G.train()
