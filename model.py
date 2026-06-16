@@ -78,7 +78,6 @@ class Generator(nn.Module):
         ])
 
         self.attn64  = SelfAttention(ch * 4)
-        self.attn128 = SelfAttention(ch * 2)
 
         self.out = nn.Sequential(
             nn.GroupNorm(8, ch // 2),
@@ -92,7 +91,6 @@ class Generator(nn.Module):
         for i, block in enumerate(self.blocks):
             x = block(x)
             if i == 3: x = self.attn64(x)
-            if i == 4: x = self.attn128(x)
         return self.out(x)
 
 
