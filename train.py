@@ -26,7 +26,7 @@ NUM_SAMPLES   = 16
 DATASET_PATH  = "./dataset"
 OUTPUT_PATH   = "./outputs"
 CKPT_PATH     = "./checkpoints"
-GITHUB_REPO   = "https://github.com/USERNAME/REPO.git"  # <- schimba asta
+GITHUB_REPO   = "https://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@github.com/LupulSalbatic/diffusion-anime.git"  # <- schimba asta
 GITHUB_FOLDER = "./github_repo"
 
 os.makedirs(OUTPUT_PATH, exist_ok=True)
