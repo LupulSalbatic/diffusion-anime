@@ -11,7 +11,7 @@ from model import Generator, Discriminator
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 IMAGE_SIZE    = 512
-BATCH_SIZE    = 8
+BATCH_SIZE    = 16
 NUM_EPOCHS    = 300
 LR_G          = 2e-5
 LR_D          = 8e-5
@@ -19,7 +19,7 @@ Z_DIM         = 128
 BASE_CH       = 64
 N_CRITIC      = 1
 LAMBDA_GP     = 5
-SAVE_EVERY    = 5
+SAVE_EVERY    = 1
 SAMPLE_EVERY  = 2
 NUM_SAMPLES   = 4          # redus la 4 pentru a evita OOM la sampling
 
