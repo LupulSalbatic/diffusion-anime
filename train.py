@@ -11,7 +11,7 @@ from model import Generator, Discriminator
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 IMAGE_SIZE    = 512
-BATCH_SIZE    = 12
+BATCH_SIZE    = 8
 NUM_EPOCHS    = 300
 LR_G          = 2e-5
 LR_D          = 8e-5
@@ -46,16 +46,28 @@ if not _TOKEN:
 
 # ─── GRADIENT PENALTY ─────────────────────────────────────────────────────────
 def gradient_penalty(disc, real, fake):
-    B = real.shape[0]
-    alpha = torch.rand(B, 1, 1, 1, device=DEVICE)
-    interp = (alpha * real + (1 - alpha) * fake.detach()).requires_grad_(True)
-    d_interp = disc(interp)
-    grad = torch.autograd.grad(
-        outputs=d_interp, inputs=interp,
-        grad_outputs=torch.ones_like(d_interp),
-        create_graph=True, retain_graph=True,
-    )[0]
-    return ((grad.view(B, -1).norm(2, dim=1) - 1) ** 2).mean()
+    """
+    Calculat MEREU in FP32 (precizie completa), niciodata in interiorul autocast.
+    Motiv: gradient penalty foloseste double-backward (torch.autograd.grad cu
+    create_graph=True), care e numeric instabil in FP16/Mixed Precision si
+    poate produce NaN dupa cateva mii de step-uri. Costul in viteza e minim,
+    fiindca doar acest calcul ruleaza in FP32, restul antrenamentului ramane
+    in Mixed Precision pentru viteza normala.
+    """
+    with torch.amp.autocast('cuda', enabled=False):
+        real = real.float()
+        fake = fake.float()
+        B = real.shape[0]
+        alpha = torch.rand(B, 1, 1, 1, device=DEVICE)
+        interp = (alpha * real + (1 - alpha) * fake.detach()).requires_grad_(True)
+        d_interp = disc(interp.float())
+        grad = torch.autograd.grad(
+            outputs=d_interp, inputs=interp,
+            grad_outputs=torch.ones_like(d_interp),
+            create_graph=True, retain_graph=True,
+        )[0]
+        gp = ((grad.view(B, -1).norm(2, dim=1) - 1) ** 2).mean()
+    return gp
 
 
 # ─── DATASET ─────────────────────────────────────────────────────────────────
@@ -194,32 +206,53 @@ def train():
             B = real.shape[0]
 
             # ── Discriminator ──
+            d_loss_val = None
             for _ in range(N_CRITIC):
                 z = torch.randn(B, Z_DIM, device=DEVICE)
                 with autocast('cuda'):
                     fake = G(z).detach()
                     d_loss = (-D(real).mean() + D(fake).mean()
                               + LAMBDA_GP * gradient_penalty(D, real, fake))
+
+                if not torch.isfinite(d_loss):
+                    print(f"[ATENTIE] D_loss nefinit (NaN/Inf) la epoca {epoch} "
+                          f"step {step} - SAR peste acest step, nu aplic gradientul.")
+                    continue
+
                 opt_D.zero_grad(set_to_none=True)
                 scaler_D.scale(d_loss).backward()
+                scaler_D.unscale_(opt_D)
+                torch.nn.utils.clip_grad_norm_(D.parameters(), max_norm=10.0)
                 scaler_D.step(opt_D)
                 scaler_D.update()
+                d_loss_val = d_loss.item()
+
+            if d_loss_val is None:
+                continue  # discriminatorul a fost instabil, sarim si generatorul pe acest step
 
             # ── Generator ──
             z = torch.randn(B, Z_DIM, device=DEVICE)
             with autocast('cuda'):
                 g_loss = -D(G(z)).mean()
+
+            if not torch.isfinite(g_loss):
+                print(f"[ATENTIE] G_loss nefinit (NaN/Inf) la epoca {epoch} "
+                      f"step {step} - SAR peste acest step, nu aplic gradientul.")
+                continue
+
             opt_G.zero_grad(set_to_none=True)
             scaler_G.scale(g_loss).backward()
+            scaler_G.unscale_(opt_G)
+            torch.nn.utils.clip_grad_norm_(G.parameters(), max_norm=10.0)
             scaler_G.step(opt_G)
             scaler_G.update()
 
-            total_d += d_loss.item()
+            total_d += d_loss_val
             total_g += g_loss.item()
 
             if step % 50 == 0:
                 print(f"Epoca [{epoch}/{NUM_EPOCHS}] Step [{step}/{len(loader)}] "
-                      f"D: {d_loss.item():.4f} G: {g_loss.item():.4f}")
+                      f"D: {d_loss_val:.4f} G: {g_loss.item():.4f}")
 
         sched_G.step()
         sched_D.step()
@@ -227,17 +260,30 @@ def train():
               f"G: {total_g/len(loader):.4f} | "
               f"LR_G: {sched_G.get_last_lr()[0]:.2e}\n")
 
+        # Verificare sanatate model (folosita si la sampling, si la checkpoint)
+        model_is_healthy = all(
+            torch.isfinite(p).all()
+            for p in list(G.parameters()) + list(D.parameters())
+        )
+
         # Sample-uri vizuale (cu torch.no_grad + batch mic)
-        if epoch % SAMPLE_EVERY == 0:
+        if model_is_healthy and epoch % SAMPLE_EVERY == 0:
             G.eval()
             with torch.no_grad():
                 samples = (G(fixed_z).clamp(-1, 1) + 1) / 2
             save_image(samples, os.path.join(OUTPUT_PATH, f"epoch_{epoch:04d}.png"), nrow=2)
             print(f"[INFO] Sample: epoch_{epoch:04d}.png")
             G.train()
+        elif not model_is_healthy:
+            print(f"[ATENTIE] Sar peste generarea sample-ului la epoca {epoch} - model corupt (NaN).")
 
         # Checkpoint + GitHub
-        if epoch % SAVE_EVERY == 0:
+        # Nu salvam NICIODATA un checkpoint daca modelul a devenit NaN/Inf.
+        if not model_is_healthy:
+            print(f"[EROARE GRAVA] Modelul are greutati NaN/Inf la epoca {epoch}! "
+                  f"NU salvez checkpoint-ul corupt. latest.pth ramane la versiunea anterioara, "
+                  f"valida. Verifica hiperparametrii (LR, LAMBDA_GP) inainte sa continui.")
+        elif epoch % SAVE_EVERY == 0:
             ckpt_data = {
                 "epoch": epoch,
                 "G": G.state_dict(),
