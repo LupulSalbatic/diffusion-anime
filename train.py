@@ -11,7 +11,7 @@ from model import Generator, Discriminator
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 IMAGE_SIZE    = 512
-BATCH_SIZE    = 16
+BATCH_SIZE    = 12
 NUM_EPOCHS    = 300
 LR_G          = 2e-5
 LR_D          = 8e-5
