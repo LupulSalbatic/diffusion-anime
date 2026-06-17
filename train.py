@@ -1,32 +1,36 @@
 import os
-import math
 import torch
 import torch.nn as nn
-import torch.nn.functional as F
 from torch.utils.data import DataLoader
 from torchvision import transforms, datasets
 from torchvision.utils import save_image
-from torch.cuda.amp import autocast, GradScaler
+from torch.amp import autocast, GradScaler
 import subprocess
 import shutil
-from model import UNet
+from model import Generator, Discriminator
 
 # ─── CONFIG ──────────────────────────────────────────────────────────────────
 IMAGE_SIZE    = 512
-BATCH_SIZE    = 4          # A4000 16GB — mareste la 6-8 daca nu ai OOM
-NUM_EPOCHS    = 500
-LEARNING_RATE = 1e-4
-T_STEPS       = 1000       # pasi de difuzie
-BETA_START    = 1e-4
-BETA_END      = 0.02
-SAVE_EVERY    = 10         # salveaza checkpoint la fiecare X epoci
-SAMPLE_EVERY  = 5          # genereaza sample-uri la fiecare X epoci
-NUM_SAMPLES   = 16
+BATCH_SIZE    = 8
+NUM_EPOCHS    = 300
+LR_G          = 2e-5
+LR_D          = 8e-5
+Z_DIM         = 128
+BASE_CH       = 64
+N_CRITIC      = 1
+LAMBDA_GP     = 5
+SAVE_EVERY    = 5
+SAMPLE_EVERY  = 2
+NUM_SAMPLES   = 4          # redus la 4 pentru a evita OOM la sampling
 
 DATASET_PATH  = "./dataset"
 OUTPUT_PATH   = "./outputs"
 CKPT_PATH     = "./checkpoints"
-GITHUB_REPO   = "https://github.com/USERNAME/REPO.git"  # <- schimba asta
+# Tokenul vine din variabila de mediu GITHUB_TOKEN (setata o data la pornirea instantei),
+# nu e niciodata scris direct in acest fisier => nimic blocat de secret scanning pe GitHub.
+_TOKEN = os.environ.get("GITHUB_TOKEN", "")
+GITHUB_REPO   = (f"https://{_TOKEN}@github.com/LupulSalbatic/diffusion-anime.git"
+                 if _TOKEN else "https://github.com/LupulSalbatic/diffusion-anime.git")
 GITHUB_FOLDER = "./github_repo"
 
 os.makedirs(OUTPUT_PATH, exist_ok=True)
@@ -35,72 +39,36 @@ os.makedirs(CKPT_PATH, exist_ok=True)
 DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(f"[INFO] Device: {DEVICE}")
 print(f"[INFO] VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+if not _TOKEN:
+    print("[ATENTIE] GITHUB_TOKEN nu e setat - checkpoint-urile NU se vor salva pe GitHub!")
+    print("          Seteaza-l cu: export GITHUB_TOKEN=ghp_xxxxx  inainte de a rula train.py")
 
 
-# ─── DDPM NOISE SCHEDULE ─────────────────────────────────────────────────────
-class DDPM:
-    def __init__(self, T=T_STEPS, beta_start=BETA_START, beta_end=BETA_END, device=DEVICE):
-        self.T = T
-        self.device = device
-
-        betas = torch.linspace(beta_start, beta_end, T, device=device)
-        alphas = 1.0 - betas
-        alphas_cumprod = torch.cumprod(alphas, dim=0)
-        alphas_cumprod_prev = F.pad(alphas_cumprod[:-1], (1, 0), value=1.0)
-
-        self.betas = betas
-        self.sqrt_alphas_cumprod = torch.sqrt(alphas_cumprod)
-        self.sqrt_one_minus_alphas_cumprod = torch.sqrt(1.0 - alphas_cumprod)
-        self.posterior_variance = betas * (1.0 - alphas_cumprod_prev) / (1.0 - alphas_cumprod)
-        self.sqrt_recip_alphas = torch.sqrt(1.0 / alphas)
-        self.sqrt_recipm1_alphas_cumprod = torch.sqrt(1.0 / alphas_cumprod - 1)
-
-    def q_sample(self, x0, t, noise=None):
-        """Adauga zgomot la imagine (forward process)"""
-        if noise is None:
-            noise = torch.randn_like(x0)
-        sqrt_alpha = self.sqrt_alphas_cumprod[t][:, None, None, None]
-        sqrt_one_minus = self.sqrt_one_minus_alphas_cumprod[t][:, None, None, None]
-        return sqrt_alpha * x0 + sqrt_one_minus * noise, noise
-
-    @torch.no_grad()
-    def p_sample(self, model, x, t_idx):
-        """Un pas de denoising (reverse process)"""
-        t = torch.full((x.shape[0],), t_idx, device=self.device, dtype=torch.long)
-        pred_noise = model(x, t)
-
-        beta_t = self.betas[t_idx]
-        sqrt_recip = self.sqrt_recip_alphas[t_idx]
-        sqrt_recipm1 = self.sqrt_recipm1_alphas_cumprod[t_idx]
-
-        mean = sqrt_recip * (x - beta_t * sqrt_recipm1 * pred_noise)
-
-        if t_idx == 0:
-            return mean
-        noise = torch.randn_like(x)
-        var = self.posterior_variance[t_idx]
-        return mean + torch.sqrt(var) * noise
-
-    @torch.no_grad()
-    def sample(self, model, n=NUM_SAMPLES, img_size=IMAGE_SIZE):
-        """Genereaza n imagini de la zero"""
-        model.eval()
-        x = torch.randn(n, 3, img_size, img_size, device=self.device)
-        for t in reversed(range(self.T)):
-            x = self.p_sample(model, x, t)
-            if t % 100 == 0:
-                print(f"  Sampling step {self.T - t}/{self.T}", end="\r")
-        model.train()
-        return (x.clamp(-1, 1) + 1) / 2  # [0, 1]
+# ─── GRADIENT PENALTY ─────────────────────────────────────────────────────────
+def gradient_penalty(disc, real, fake):
+    B = real.shape[0]
+    alpha = torch.rand(B, 1, 1, 1, device=DEVICE)
+    interp = (alpha * real + (1 - alpha) * fake.detach()).requires_grad_(True)
+    d_interp = disc(interp)
+    grad = torch.autograd.grad(
+        outputs=d_interp, inputs=interp,
+        grad_outputs=torch.ones_like(d_interp),
+        create_graph=True, retain_graph=True,
+    )[0]
+    return ((grad.view(B, -1).norm(2, dim=1) - 1) ** 2).mean()
 
 
 # ─── DATASET ─────────────────────────────────────────────────────────────────
 def get_dataloader():
     transform = transforms.Compose([
-        transforms.Resize((IMAGE_SIZE, IMAGE_SIZE)),
+        transforms.Resize((IMAGE_SIZE + 32, IMAGE_SIZE + 32),
+                          interpolation=transforms.InterpolationMode.LANCZOS),
+        transforms.RandomCrop(IMAGE_SIZE),
         transforms.RandomHorizontalFlip(),
+        transforms.ColorJitter(brightness=0.15, contrast=0.15,
+                               saturation=0.15, hue=0.05),
         transforms.ToTensor(),
-        transforms.Normalize([0.5, 0.5, 0.5], [0.5, 0.5, 0.5]),  # [-1, 1]
+        transforms.Normalize([0.5]*3, [0.5]*3),
     ])
     dataset = datasets.ImageFolder(DATASET_PATH, transform=transform)
     print(f"[INFO] Dataset: {len(dataset)} imagini")
@@ -110,113 +78,185 @@ def get_dataloader():
         shuffle=True,
         num_workers=4,
         pin_memory=True,
+        drop_last=True,
+        persistent_workers=True,  # workers raman activi intre epoci
     )
 
 
 # ─── GITHUB SAVE ─────────────────────────────────────────────────────────────
-def save_to_github(epoch, ckpt_file):
-    """Push checkpoint pe GitHub"""
-    try:
-        if not os.path.exists(GITHUB_FOLDER):
-            subprocess.run(["git", "clone", GITHUB_REPO, GITHUB_FOLDER], check=True)
+def setup_github_repo():
+    """Clona o singura data si configureaza Git LFS pentru fisiere .pth"""
+    if not os.path.exists(GITHUB_FOLDER):
+        subprocess.run(["git", "clone", GITHUB_REPO, GITHUB_FOLDER], check=True)
+        subprocess.run(["git", "-C", GITHUB_FOLDER, "lfs", "install"], check=True)
+        subprocess.run(["git", "-C", GITHUB_FOLDER, "lfs", "track", "*.pth"], check=True)
+        subprocess.run(["git", "-C", GITHUB_FOLDER, "add", ".gitattributes"], check=True)
+        subprocess.run(["git", "-C", GITHUB_FOLDER, "commit", "-m", "setup lfs"],
+                       check=False)
 
-        dest = os.path.join(GITHUB_FOLDER, "checkpoints", f"epoch_{epoch}.pth")
-        os.makedirs(os.path.dirname(dest), exist_ok=True)
-        shutil.copy(ckpt_file, dest)
+
+def save_to_github(epoch):
+    """
+    Trimite pe GitHub DOAR:
+    - checkpoints/latest.pth   (pentru resume pe alta placa)
+    - checkpoints/best.pth     (cea mai buna epoca)
+    - outputs/*.png            (toate sample-urile, sunt mici)
+    Nu mai trimite cate un fisier separat per epoca.
+    """
+    try:
+        setup_github_repo()
+
+        dst_ckpt = os.path.join(GITHUB_FOLDER, "checkpoints")
+        os.makedirs(dst_ckpt, exist_ok=True)
+        shutil.copy(os.path.join(CKPT_PATH, "latest.pth"),
+                    os.path.join(dst_ckpt, "latest.pth"))
+        best_path = os.path.join(CKPT_PATH, "best.pth")
+        if os.path.exists(best_path):
+            shutil.copy(best_path, os.path.join(dst_ckpt, "best.pth"))
+
+        dst_out = os.path.join(GITHUB_FOLDER, "outputs")
+        os.makedirs(dst_out, exist_ok=True)
+        for f in os.listdir(OUTPUT_PATH):
+            shutil.copy(os.path.join(OUTPUT_PATH, f), os.path.join(dst_out, f))
 
         subprocess.run(["git", "-C", GITHUB_FOLDER, "add", "."], check=True)
-        subprocess.run(["git", "-C", GITHUB_FOLDER, "commit", "-m", f"checkpoint epoch {epoch}"], check=True)
-        subprocess.run(["git", "-C", GITHUB_FOLDER, "push"], check=True)
-        print(f"[GitHub] Checkpoint epoch {epoch} salvat!")
+        result = subprocess.run(["git", "-C", GITHUB_FOLDER, "commit",
+                                 "-m", f"GAN epoch {epoch}"], capture_output=True)
+        if result.returncode == 0:
+            subprocess.run(["git", "-C", GITHUB_FOLDER, "push"], check=True)
+            print(f"[GitHub] Salvat epoch {epoch} (latest + best + outputs)!")
+        else:
+            print(f"[GitHub] Nimic nou de salvat la epoch {epoch}")
     except Exception as e:
         print(f"[GitHub] EROARE: {e}")
 
 
 # ─── TRAINING ────────────────────────────────────────────────────────────────
 def train():
-    model = UNet(
-        in_ch=3,
-        base_ch=128,
-        ch_mult=(1, 2, 3, 4, 4),
-        num_res_blocks=3,
-        attn_resolutions=(32, 16, 8),
-        dropout=0.1,
-        image_size=IMAGE_SIZE,
-    ).to(DEVICE)
+    torch.backends.cudnn.benchmark = True
 
-    total_params = sum(p.numel() for p in model.parameters()) / 1e6
-    print(f"[INFO] Parametri model: {total_params:.1f}M")
+    G = Generator(z_dim=Z_DIM, base_ch=BASE_CH).to(DEVICE)
+    D = Discriminator(base_ch=BASE_CH).to(DEVICE)
 
-    ddpm      = DDPM()
-    optimizer = torch.optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=1e-4)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=NUM_EPOCHS)
-    scaler    = GradScaler()
-    loader    = get_dataloader()
+    g_params = sum(p.numel() for p in G.parameters()) / 1e6
+    d_params = sum(p.numel() for p in D.parameters()) / 1e6
+    print(f"[INFO] Generator: {g_params:.1f}M parametri")
+    print(f"[INFO] Discriminator: {d_params:.1f}M parametri")
 
-    # Resume daca exista checkpoint
+    opt_G = torch.optim.Adam(G.parameters(), lr=LR_G, betas=(0.0, 0.9))
+    opt_D = torch.optim.Adam(D.parameters(), lr=LR_D, betas=(0.0, 0.9))
+
+    # LR scade lin de la 100% la 10% pe parcursul antrenamentului
+    sched_G = torch.optim.lr_scheduler.LinearLR(
+        opt_G, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPOCHS)
+    sched_D = torch.optim.lr_scheduler.LinearLR(
+        opt_D, start_factor=1.0, end_factor=0.1, total_iters=NUM_EPOCHS)
+
+    scaler_G = GradScaler('cuda')
+    scaler_D = GradScaler('cuda')
+
+    loader = get_dataloader()
+
+    # Resume automat
     start_epoch = 0
     latest_ckpt = os.path.join(CKPT_PATH, "latest.pth")
     if os.path.exists(latest_ckpt):
-        ckpt = torch.load(latest_ckpt, map_location=DEVICE)
-        model.load_state_dict(ckpt["model"])
-        optimizer.load_state_dict(ckpt["optimizer"])
+        ckpt = torch.load(latest_ckpt, map_location=DEVICE, weights_only=True)
+        G.load_state_dict(ckpt["G"])
+        D.load_state_dict(ckpt["D"])
+        opt_G.load_state_dict(ckpt["opt_G"])
+        opt_D.load_state_dict(ckpt["opt_D"])
         start_epoch = ckpt["epoch"] + 1
         print(f"[INFO] Resumed de la epoca {start_epoch}")
+
+    # Noise fix pentru sample-uri consistente intre epoci
+    fixed_z = torch.randn(NUM_SAMPLES, Z_DIM, device=DEVICE)
+
+    # Track cel mai bun G_loss pentru salvarea best.pth
+    # (G_loss mai mic/mai negativ = generatorul reuseste mai bine sa pacaleasca discriminatorul,
+    # dar metrica reala importanta e calitatea vizuala; asta e doar un proxy aproximativ)
+    best_ckpt = os.path.join(CKPT_PATH, "best.pth")
+    best_g_loss = float("inf")
+    if os.path.exists(best_ckpt):
+        prev_best = torch.load(best_ckpt, map_location="cpu", weights_only=True)
+        best_g_loss = prev_best.get("best_g_loss", float("inf"))
+        print(f"[INFO] Cel mai bun G_loss salvat anterior: {best_g_loss:.4f}")
 
     print(f"[INFO] Incep antrenamentul de la epoca {start_epoch}...")
 
     for epoch in range(start_epoch, NUM_EPOCHS):
-        model.train()
-        total_loss = 0
+        G.train()
+        D.train()
+        total_d, total_g = 0.0, 0.0
 
-        for step, (imgs, _) in enumerate(loader):
-            imgs = imgs.to(DEVICE)
-            t    = torch.randint(0, ddpm.T, (imgs.shape[0],), device=DEVICE).long()
+        for step, (real, _) in enumerate(loader):
+            real = real.to(DEVICE, non_blocking=True)
+            B = real.shape[0]
 
-            with autocast():
-                noisy_imgs, noise = ddpm.q_sample(imgs, t)
-                pred_noise        = model(noisy_imgs, t)
-                loss              = F.mse_loss(pred_noise, noise)
+            # ── Discriminator ──
+            for _ in range(N_CRITIC):
+                z = torch.randn(B, Z_DIM, device=DEVICE)
+                with autocast('cuda'):
+                    fake = G(z).detach()
+                    d_loss = (-D(real).mean() + D(fake).mean()
+                              + LAMBDA_GP * gradient_penalty(D, real, fake))
+                opt_D.zero_grad(set_to_none=True)
+                scaler_D.scale(d_loss).backward()
+                scaler_D.step(opt_D)
+                scaler_D.update()
 
-            optimizer.zero_grad()
-            scaler.scale(loss).backward()
-            scaler.unscale_(optimizer)
-            nn.utils.clip_grad_norm_(model.parameters(), 1.0)
-            scaler.step(optimizer)
-            scaler.update()
+            # ── Generator ──
+            z = torch.randn(B, Z_DIM, device=DEVICE)
+            with autocast('cuda'):
+                g_loss = -D(G(z)).mean()
+            opt_G.zero_grad(set_to_none=True)
+            scaler_G.scale(g_loss).backward()
+            scaler_G.step(opt_G)
+            scaler_G.update()
 
-            total_loss += loss.item()
+            total_d += d_loss.item()
+            total_g += g_loss.item()
 
             if step % 50 == 0:
-                print(f"Epoca [{epoch}/{NUM_EPOCHS}] Step [{step}/{len(loader)}] Loss: {loss.item():.4f}")
+                print(f"Epoca [{epoch}/{NUM_EPOCHS}] Step [{step}/{len(loader)}] "
+                      f"D: {d_loss.item():.4f} G: {g_loss.item():.4f}")
 
-        avg_loss = total_loss / len(loader)
-        scheduler.step()
-        print(f"\n[Epoca {epoch}] Loss mediu: {avg_loss:.4f} | LR: {scheduler.get_last_lr()[0]:.6f}\n")
+        sched_G.step()
+        sched_D.step()
+        print(f"\n[Epoca {epoch}] D: {total_d/len(loader):.4f} | "
+              f"G: {total_g/len(loader):.4f} | "
+              f"LR_G: {sched_G.get_last_lr()[0]:.2e}\n")
 
-        # Sample-uri vizuale
+        # Sample-uri vizuale (cu torch.no_grad + batch mic)
         if epoch % SAMPLE_EVERY == 0:
-            samples = ddpm.sample(model, n=NUM_SAMPLES)
-            save_image(samples, os.path.join(OUTPUT_PATH, f"sample_epoch_{epoch}.png"), nrow=4)
-            print(f"[INFO] Sample salvat: sample_epoch_{epoch}.png")
+            G.eval()
+            with torch.no_grad():
+                samples = (G(fixed_z).clamp(-1, 1) + 1) / 2
+            save_image(samples, os.path.join(OUTPUT_PATH, f"epoch_{epoch:04d}.png"), nrow=2)
+            print(f"[INFO] Sample: epoch_{epoch:04d}.png")
+            G.train()
 
-        # Checkpoint local
+        # Checkpoint + GitHub
         if epoch % SAVE_EVERY == 0:
-            ckpt_file = os.path.join(CKPT_PATH, f"epoch_{epoch}.pth")
-            torch.save({
-                "epoch":     epoch,
-                "model":     model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "loss":      avg_loss,
-            }, ckpt_file)
-            torch.save({
-                "epoch":     epoch,
-                "model":     model.state_dict(),
-                "optimizer": optimizer.state_dict(),
-                "loss":      avg_loss,
-            }, latest_ckpt)
-            print(f"[INFO] Checkpoint salvat: epoch_{epoch}.pth")
-            save_to_github(epoch, ckpt_file)
+            ckpt_data = {
+                "epoch": epoch,
+                "G": G.state_dict(),
+                "D": D.state_dict(),
+                "opt_G": opt_G.state_dict(),
+                "opt_D": opt_D.state_dict(),
+            }
+            torch.save(ckpt_data, latest_ckpt)
+            print(f"[INFO] Checkpoint salvat: latest.pth (epoca {epoch})")
+
+            avg_g = total_g / len(loader)
+            if avg_g < best_g_loss:
+                best_g_loss = avg_g
+                best_data = dict(ckpt_data)
+                best_data["best_g_loss"] = best_g_loss
+                torch.save(best_data, best_ckpt)
+                print(f"[INFO] Nou record! best.pth actualizat (G_loss={best_g_loss:.4f})")
+
+            save_to_github(epoch)
 
 
 if __name__ == "__main__":
